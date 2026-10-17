@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Inventaire incrémental de fichiers avec SQLite et détection de doublons."""
 
 import argparse
@@ -14,17 +13,33 @@ from pathlib import Path
 def connect_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY,
+            root TEXT NOT NULL DEFAULT '',
             size INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL,
             sha256 TEXT NOT NULL,
-            checked_at TEXT NOT NULL
+            checked_at TEXT NOT NULL,
+            last_seen_scan TEXT NOT NULL DEFAULT ''
         )
     """)
+    # Migration douce si la base a été créée avec une version précédente du script.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+    if "root" not in columns:
+        conn.execute("ALTER TABLE files ADD COLUMN root TEXT NOT NULL DEFAULT ''")
+    if "last_seen_scan" not in columns:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN last_seen_scan TEXT NOT NULL DEFAULT ''"
+        )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_size ON files(size)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_root_seen ON files(root, last_seen_scan)"
+    )
     conn.commit()
     return conn
 
@@ -46,83 +61,142 @@ def is_inside(path: Path, root: Path) -> bool:
 
 
 def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
-    # Charger les métadonnées existantes pour éviter de recalculer les hashes.
-    existing = {
-        row[0]: (row[1], row[2], row[3])
-        for row in conn.execute("SELECT path, size, mtime_ns, sha256 FROM files")
-    }
-    seen: set[str] = set()
-    examined = hashed = reused = errors = 0
-    now = datetime.now(timezone.utc).isoformat()
+    """Actualise les racines une par une, sans charger un million de chemins en RAM."""
+    total_examined = total_hashed = total_reused = total_removed = total_errors = 0
+    db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+    excluded_db_paths = {str(db_file), str(db_file) + "-wal", str(db_file) + "-shm"}
 
     for root in roots:
+        root = root.resolve()
         if not root.exists() or not root.is_dir():
-            print(f"AVERTISSEMENT : dossier inaccessible ou inexistant : {root}", file=sys.stderr)
-            errors += 1
+            print(
+                f"ERREUR : racine absente ou inaccessible : {root}. Rien supprimé de cette racine.",
+                file=sys.stderr,
+            )
+            total_errors += 1
             continue
 
-        for folder, dirnames, filenames in os.walk(root, followlinks=False):
-            # Ne pas entrer dans les dossiers symboliques.
-            dirnames[:] = [
-                name for name in dirnames
-                if not (Path(folder) / name).is_symlink()
-            ]
-            for filename in filenames:
-                path = Path(folder) / filename
-                if path.is_symlink():
-                    continue
+        # Protection contre un point de montage déconnecté : ne pas scanner son dossier vide.
+        # On ne l'applique qu'aux chemins sous /mnt; les racines personnelles restent permises.
+        if str(root).startswith("/mnt/") and not os.path.ismount(root):
+            print(
+                f"ERREUR : {root} n'est pas détecté comme point de montage. Racine ignorée pour éviter une suppression accidentelle.",
+                file=sys.stderr,
+            )
+            total_errors += 1
+            continue
 
-                try:
-                    stat = path.stat()
-                    if not path.is_file():
+        scan_id = datetime.now(timezone.utc).isoformat() + f"-{os.getpid()}"
+        examined = hashed = reused = errors = 0
+        now = datetime.now(timezone.utc).isoformat()
+        print(f"\nAnalyse : {root}", flush=True)
+        conn.execute("BEGIN")
+        try:
+            for folder, dirnames, filenames in os.walk(root, followlinks=False):
+                dir_path = Path(folder)
+                # Ne pas suivre les liens symboliques vers des dossiers.
+                dirnames[:] = [
+                    name for name in dirnames if not (dir_path / name).is_symlink()
+                ]
+                for filename in filenames:
+                    path = dir_path / filename
+                    if path.is_symlink():
                         continue
-                    path_key = str(path.resolve())
-                    seen.add(path_key)
-                    examined += 1
-                    previous = existing.get(path_key)
-
-                    if previous and previous[0] == stat.st_size and previous[1] == stat.st_mtime_ns:
-                        checksum = previous[2]
-                        reused += 1
-                    else:
-                        # Éviter d'enregistrer un hash si le fichier change pendant la lecture.
-                        checksum = sha256_file(path)
-                        stat_after = path.stat()
-                        if stat.st_size != stat_after.st_size or stat.st_mtime_ns != stat_after.st_mtime_ns:
-                            print(f"MODIFIÉ PENDANT LA LECTURE, ignoré pour cette passe : {path}", file=sys.stderr)
-                            errors += 1
+                    try:
+                        stat = path.stat()
+                        if not path.is_file():
                             continue
-                        hashed += 1
+                        path_key = str(path.resolve())
+                        examined += 1
+                        previous = conn.execute(
+                            "SELECT size, mtime_ns, sha256 FROM files WHERE path = ?",
+                            (path_key,),
+                        ).fetchone()
+                        if (
+                            previous
+                            and previous[0] == stat.st_size
+                            and previous[1] == stat.st_mtime_ns
+                        ):
+                            checksum = previous[2]
+                            reused += 1
+                        else:
+                            checksum = sha256_file(path)
+                            stat_after = path.stat()
+                            if (
+                                stat.st_size != stat_after.st_size
+                                or stat.st_mtime_ns != stat_after.st_mtime_ns
+                            ):
+                                print(
+                                    f"MODIFIÉ PENDANT LA LECTURE : {path}",
+                                    file=sys.stderr,
+                                )
+                                errors += 1
+                                continue
+                            hashed += 1
 
-                    conn.execute("""
-                        INSERT INTO files(path, size, mtime_ns, sha256, checked_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(path) DO UPDATE SET
-                            size=excluded.size,
-                            mtime_ns=excluded.mtime_ns,
-                            sha256=excluded.sha256,
-                            checked_at=excluded.checked_at
-                    """, (path_key, stat.st_size, stat.st_mtime_ns, checksum, now))
-                except (OSError, PermissionError) as exc:
-                    print(f"ERREUR : {path} : {exc}", file=sys.stderr)
-                    errors += 1
+                        conn.execute(
+                            """
+                            INSERT INTO files(path, root, size, mtime_ns, sha256, checked_at, last_seen_scan)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(path) DO UPDATE SET
+                                root=excluded.root, size=excluded.size, mtime_ns=excluded.mtime_ns,
+                                sha256=excluded.sha256, checked_at=excluded.checked_at,
+                                last_seen_scan=excluded.last_seen_scan
+                        """,
+                            (
+                                path_key,
+                                str(root),
+                                stat.st_size,
+                                stat.st_mtime_ns,
+                                checksum,
+                                now,
+                                scan_id,
+                            ),
+                        )
 
-    # Supprimer de l'inventaire les fichiers disparus des racines analysées.
-    # Les autres racines (non passées à cette commande) restent intactes.
-    removed = 0
-    all_paths = [row[0] for row in conn.execute("SELECT path FROM files")]
-    for old_path in all_paths:
-        old = Path(old_path)
-        if any(is_inside(old, root) for root in roots) and old_path not in seen:
-            conn.execute("DELETE FROM files WHERE path = ?", (old_path,))
-            removed += 1
+                        if examined % 1000 == 0:
+                            conn.commit()
+                            conn.execute("BEGIN")
+                            print(f"  {examined:,} fichiers examinés…", flush=True)
+                    except OSError as exc:
+                        print(f"ERREUR : {path} : {exc}", file=sys.stderr)
+                        errors += 1
 
-    conn.commit()
-    print(f"Fichiers examinés : {examined}")
-    print(f"Checksums calculés : {hashed}")
-    print(f"Checksums réutilisés : {reused}")
-    print(f"Entrées supprimées de l'inventaire : {removed}")
-    print(f"Erreurs / avertissements : {errors}")
+            # Ne purger les entrées absentes que si le parcours a été sans erreur.
+            # En cas de permissions refusées ou de lecture instable, on conserve l'ancien inventaire.
+            removed = 0
+            if errors == 0:
+                removed = conn.execute(
+                    "DELETE FROM files WHERE root = ? AND last_seen_scan <> ?",
+                    (str(root), scan_id),
+                ).rowcount
+            else:
+                print(
+                    f"Attention : {errors} erreur(s); aucune entrée ancienne supprimée pour {root}.",
+                    file=sys.stderr,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        total_examined += examined
+        total_hashed += hashed
+        total_reused += reused
+        total_removed += removed
+        total_errors += errors
+        print(f"  Fichiers examinés : {examined:,}")
+        print(f"  Checksums calculés : {hashed:,}")
+        print(f"  Checksums réutilisés : {reused:,}")
+        print(f"  Entrées supprimées : {removed:,}")
+        print(f"  Erreurs : {errors:,}")
+
+    print("\nBilan global")
+    print(f"Fichiers examinés : {total_examined:,}")
+    print(f"Checksums calculés : {total_hashed:,}")
+    print(f"Checksums réutilisés : {total_reused:,}")
+    print(f"Entrées supprimées : {total_removed:,}")
+    print(f"Erreurs / racines ignorées : {total_errors:,}")
 
 
 def duplicates(conn: sqlite3.Connection, csv_path: Path | None) -> None:
@@ -137,47 +211,70 @@ def duplicates(conn: sqlite3.Connection, csv_path: Path | None) -> None:
         ) AS groups ON groups.sha256 = f.sha256
         ORDER BY f.sha256, f.path
     """
-    rows = conn.execute(query).fetchall()
+    cursor = conn.execute(query)
 
     if csv_path:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
+        row_count = 0
         with csv_path.open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream, delimiter=";")
-            writer.writerow(["sha256", "nombre_fichiers", "taille_octets", "dossier", "fichier", "chemin_complet"])
-            for checksum, size, full_path, count in rows:
+            writer.writerow(
+                [
+                    "sha256",
+                    "nombre_fichiers",
+                    "taille_octets",
+                    "dossier",
+                    "fichier",
+                    "chemin_complet",
+                ]
+            )
+            for checksum, size, full_path, count in cursor:
                 path = Path(full_path)
-                writer.writerow([checksum, count, size, str(path.parent), path.name, full_path])
+                writer.writerow(
+                    [checksum, count, size, str(path.parent), path.name, full_path]
+                )
+                row_count += 1
         print(f"Rapport CSV écrit : {csv_path}")
-        print(f"Fichiers dans les groupes de doublons : {len(rows)}")
-        return
-
-    if not rows:
-        print("Aucun doublon trouvé dans l'inventaire.")
+        print(f"Fichiers dans les groupes de doublons : {row_count}")
         return
 
     current_checksum = None
-    for checksum, size, full_path, count in rows:
+    row_count = 0
+    for checksum, size, full_path, count in cursor:
+        row_count += 1
         if checksum != current_checksum:
             if current_checksum is not None:
                 print()
             print(f"SHA-256 : {checksum}  |  {count} fichiers  |  {size} octets")
             current_checksum = checksum
         print(f"  {full_path}")
+    if row_count == 0:
+        print("Aucun doublon trouvé dans l'inventaire.")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Inventaire incrémental de fichiers et recherche de doublons par SHA-256."
     )
-    parser.add_argument("--db", type=Path, default=Path("inventaire_fichiers.db"),
-                        help="fichier SQLite (défaut : ./inventaire_fichiers.db)")
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=Path("inventaire_fichiers.db"),
+        help="fichier SQLite (défaut : ./inventaire_fichiers.db)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = subparsers.add_parser("scan", help="créer ou actualiser l'inventaire")
-    scan_parser.add_argument("roots", nargs="+", type=Path, help="un ou plusieurs dossiers à analyser")
+    scan_parser.add_argument(
+        "roots", nargs="+", type=Path, help="un ou plusieurs dossiers à analyser"
+    )
 
-    dup_parser = subparsers.add_parser("duplicates", help="afficher ou exporter les doublons")
-    dup_parser.add_argument("--csv", type=Path, help="exporter le rapport dans un fichier CSV")
+    dup_parser = subparsers.add_parser(
+        "duplicates", help="afficher ou exporter les doublons"
+    )
+    dup_parser.add_argument(
+        "--csv", type=Path, help="exporter le rapport dans un fichier CSV"
+    )
 
     args = parser.parse_args()
     db_path = args.db.expanduser().resolve()
