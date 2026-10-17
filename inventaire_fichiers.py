@@ -1,6 +1,16 @@
-"""Inventaire incrémental de fichiers avec SQLite et détection de doublons."""
+"""Inventaire incrémental de fichiers avec SQLite et détection de doublons.
 
-import argparse
+Usage:
+  inventaire_fichiers.py [--db=<db>] scan <roots>...
+  inventaire_fichiers.py [--db=<db>] duplicates [--csv=<csv>]
+  inventaire_fichiers.py (-h | --help)
+
+Options:
+  --db=<db>    Fichier SQLite [default: inventaire_fichiers.db].
+  --csv=<csv>  Exporter les doublons vers ce fichier CSV.
+  -h --help    Afficher cette aide.
+"""
+
 import csv
 import hashlib
 import os
@@ -8,6 +18,8 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from docopt import docopt
 
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
@@ -32,17 +44,12 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     if "root" not in columns:
         conn.execute("ALTER TABLE files ADD COLUMN root TEXT NOT NULL DEFAULT ''")
     if "last_seen_scan" not in columns:
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN last_seen_scan TEXT NOT NULL DEFAULT ''"
-        )
+        conn.execute("ALTER TABLE files ADD COLUMN last_seen_scan TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_size ON files(size)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_files_root_seen ON files(root, last_seen_scan)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_root_seen ON files(root, last_seen_scan)")
     conn.commit()
     return conn
-
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -69,20 +76,14 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
     for root in roots:
         root = root.resolve()
         if not root.exists() or not root.is_dir():
-            print(
-                f"ERREUR : racine absente ou inaccessible : {root}. Rien supprimé de cette racine.",
-                file=sys.stderr,
-            )
+            print(f"ERREUR : racine absente ou inaccessible : {root}. Rien supprimé de cette racine.", file=sys.stderr)
             total_errors += 1
             continue
 
         # Protection contre un point de montage déconnecté : ne pas scanner son dossier vide.
         # On ne l'applique qu'aux chemins sous /mnt; les racines personnelles restent permises.
         if str(root).startswith("/mnt/") and not os.path.ismount(root):
-            print(
-                f"ERREUR : {root} n'est pas détecté comme point de montage. Racine ignorée pour éviter une suppression accidentelle.",
-                file=sys.stderr,
-            )
+            print(f"ERREUR : {root} n'est pas détecté comme point de montage. Racine ignorée pour éviter une suppression accidentelle.", file=sys.stderr)
             total_errors += 1
             continue
 
@@ -95,9 +96,7 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
             for folder, dirnames, filenames in os.walk(root, followlinks=False):
                 dir_path = Path(folder)
                 # Ne pas suivre les liens symboliques vers des dossiers.
-                dirnames[:] = [
-                    name for name in dirnames if not (dir_path / name).is_symlink()
-                ]
+                dirnames[:] = [name for name in dirnames if not (dir_path / name).is_symlink()]
                 for filename in filenames:
                     path = dir_path / filename
                     if path.is_symlink():
@@ -109,50 +108,28 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
                         path_key = str(path.resolve())
                         examined += 1
                         previous = conn.execute(
-                            "SELECT size, mtime_ns, sha256 FROM files WHERE path = ?",
-                            (path_key,),
+                            "SELECT size, mtime_ns, sha256 FROM files WHERE path = ?", (path_key,)
                         ).fetchone()
-                        if (
-                            previous
-                            and previous[0] == stat.st_size
-                            and previous[1] == stat.st_mtime_ns
-                        ):
+                        if previous and previous[0] == stat.st_size and previous[1] == stat.st_mtime_ns:
                             checksum = previous[2]
                             reused += 1
                         else:
                             checksum = sha256_file(path)
                             stat_after = path.stat()
-                            if (
-                                stat.st_size != stat_after.st_size
-                                or stat.st_mtime_ns != stat_after.st_mtime_ns
-                            ):
-                                print(
-                                    f"MODIFIÉ PENDANT LA LECTURE : {path}",
-                                    file=sys.stderr,
-                                )
+                            if stat.st_size != stat_after.st_size or stat.st_mtime_ns != stat_after.st_mtime_ns:
+                                print(f"MODIFIÉ PENDANT LA LECTURE : {path}", file=sys.stderr)
                                 errors += 1
                                 continue
                             hashed += 1
 
-                        conn.execute(
-                            """
+                        conn.execute("""
                             INSERT INTO files(path, root, size, mtime_ns, sha256, checked_at, last_seen_scan)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(path) DO UPDATE SET
                                 root=excluded.root, size=excluded.size, mtime_ns=excluded.mtime_ns,
                                 sha256=excluded.sha256, checked_at=excluded.checked_at,
                                 last_seen_scan=excluded.last_seen_scan
-                        """,
-                            (
-                                path_key,
-                                str(root),
-                                stat.st_size,
-                                stat.st_mtime_ns,
-                                checksum,
-                                now,
-                                scan_id,
-                            ),
-                        )
+                        """, (path_key, str(root), stat.st_size, stat.st_mtime_ns, checksum, now, scan_id))
 
                         if examined % 1000 == 0:
                             conn.commit()
@@ -168,13 +145,10 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
             if errors == 0:
                 removed = conn.execute(
                     "DELETE FROM files WHERE root = ? AND last_seen_scan <> ?",
-                    (str(root), scan_id),
+                    (str(root), scan_id)
                 ).rowcount
             else:
-                print(
-                    f"Attention : {errors} erreur(s); aucune entrée ancienne supprimée pour {root}.",
-                    file=sys.stderr,
-                )
+                print(f"Attention : {errors} erreur(s); aucune entrée ancienne supprimée pour {root}.", file=sys.stderr)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -198,7 +172,6 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
     print(f"Entrées supprimées : {total_removed:,}")
     print(f"Erreurs / racines ignorées : {total_errors:,}")
 
-
 def duplicates(conn: sqlite3.Connection, csv_path: Path | None) -> None:
     query = """
         SELECT f.sha256, f.size, f.path, groups.file_count
@@ -218,21 +191,10 @@ def duplicates(conn: sqlite3.Connection, csv_path: Path | None) -> None:
         row_count = 0
         with csv_path.open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream, delimiter=";")
-            writer.writerow(
-                [
-                    "sha256",
-                    "nombre_fichiers",
-                    "taille_octets",
-                    "dossier",
-                    "fichier",
-                    "chemin_complet",
-                ]
-            )
+            writer.writerow(["sha256", "nombre_fichiers", "taille_octets", "dossier", "fichier", "chemin_complet"])
             for checksum, size, full_path, count in cursor:
                 path = Path(full_path)
-                writer.writerow(
-                    [checksum, count, size, str(path.parent), path.name, full_path]
-                )
+                writer.writerow([checksum, count, size, str(path.parent), path.name, full_path])
                 row_count += 1
         print(f"Rapport CSV écrit : {csv_path}")
         print(f"Fichiers dans les groupes de doublons : {row_count}")
@@ -253,44 +215,21 @@ def duplicates(conn: sqlite3.Connection, csv_path: Path | None) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Inventaire incrémental de fichiers et recherche de doublons par SHA-256."
-    )
-    parser.add_argument(
-        "--db",
-        type=Path,
-        default=Path("inventaire_fichiers.db"),
-        help="fichier SQLite (défaut : ./inventaire_fichiers.db)",
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    scan_parser = subparsers.add_parser("scan", help="créer ou actualiser l'inventaire")
-    scan_parser.add_argument(
-        "roots", nargs="+", type=Path, help="un ou plusieurs dossiers à analyser"
-    )
-
-    dup_parser = subparsers.add_parser(
-        "duplicates", help="afficher ou exporter les doublons"
-    )
-    dup_parser.add_argument(
-        "--csv", type=Path, help="exporter le rapport dans un fichier CSV"
-    )
-
-    args = parser.parse_args()
-    db_path = args.db.expanduser().resolve()
+    args = docopt(__doc__)
+    db_path = Path(args["--db"]).expanduser().resolve()
 
     try:
         with connect_db(db_path) as conn:
-            if args.command == "scan":
-                roots = [root.expanduser().resolve() for root in args.roots]
+            if args["scan"]:
+                roots = [Path(root).expanduser().resolve() for root in args["<roots>"]]
                 scan(conn, roots)
-            elif args.command == "duplicates":
-                duplicates(conn, args.csv.expanduser() if args.csv else None)
+            elif args["duplicates"]:
+                csv_value = args["--csv"]
+                duplicates(conn, Path(csv_value).expanduser() if csv_value else None)
     except sqlite3.Error as exc:
         print(f"Erreur SQLite : {exc}", file=sys.stderr)
         return 1
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
