@@ -16,10 +16,13 @@ import hashlib
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from docopt import docopt
+
+# pour éviter l'arrêt de l'ordinateur: $ systemd-inhibit --what=idle:sleep --why="Inventaire de fichiers en cours" python inventaire_fichiers.py scan /home/francois /mnt/Public /mnt/MyBookNoir
 
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
@@ -51,11 +54,27 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-def sha256_file(path: Path) -> str:
+
+def format_bytes(value: int) -> str:
+    """Formate un nombre d'octets en unités lisibles (base 1024)."""
+    amount = float(value)
+    for unit in ("B", "K", "M", "G", "T", "P"):
+        if amount < 1024 or unit == "P":
+            if unit == "B":
+                return f"{int(amount)}{unit}"
+            return f"{amount:.1f}{unit}"
+        amount /= 1024
+    return f"{amount:.1f}P"
+
+
+def sha256_file(path: Path, on_bytes_read=None) -> str:
+    """Calcule le SHA-256 et signale les octets lus à chaque bloc."""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+            if on_bytes_read is not None:
+                on_bytes_read(len(chunk))
     return digest.hexdigest()
 
 
@@ -69,7 +88,7 @@ def is_inside(path: Path, root: Path) -> bool:
 
 def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
     """Actualise les racines une par une, sans charger un million de chemins en RAM."""
-    total_examined = total_hashed = total_reused = total_removed = total_errors = 0
+    total_examined = total_hashed = total_reused = total_bytes_hashed = total_removed = total_errors = 0
     db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
     excluded_db_paths = {str(db_file), str(db_file) + "-wal", str(db_file) + "-shm"}
 
@@ -83,15 +102,41 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
         # Protection contre un point de montage déconnecté : ne pas scanner son dossier vide.
         # On ne l'applique qu'aux chemins sous /mnt; les racines personnelles restent permises.
         if str(root).startswith("/mnt/") and not os.path.ismount(root):
-            print(f"ERREUR : {root} n'est pas détecté comme point de montage. Racine ignorée pour éviter une suppression accidentelle.", file=sys.stderr)
+            print(
+                f"ERREUR : {root} n'est pas détecté comme point de montage. Racine ignorée pour éviter une suppression accidentelle.",
+                file=sys.stderr,
+            )
             total_errors += 1
             continue
 
         scan_id = datetime.now(timezone.utc).isoformat() + f"-{os.getpid()}"
-        examined = hashed = reused = errors = 0
+        examined = hashed = reused = errors = bytes_hashed = 0
+        last_progress = time.monotonic()
         now = datetime.now(timezone.utc).isoformat()
         print(f"\nAnalyse : {root}", flush=True)
         conn.execute("BEGIN")
+
+        def report_progress(current_time: float) -> None:
+            nonlocal last_progress
+            elapsed = int(current_time - last_progress)
+            print(
+                f"  {examined:,} fichiers | {hashed:,} hashés | "
+                f"{reused:,} réutilisés | SHA-256 : {format_bytes(bytes_hashed)} | "
+                f"{errors:,} erreurs (~{elapsed} s)",
+                flush=True,
+            )
+            last_progress = current_time
+
+        def count_hashed_bytes(amount: int) -> None:
+            nonlocal bytes_hashed, last_progress
+            bytes_hashed += amount
+            current_time = time.monotonic()
+            if current_time - last_progress >= 30:
+                # Valider les écritures précédentes même si le fichier courant est très gros.
+                conn.commit()
+                conn.execute("BEGIN")
+                report_progress(current_time)
+
         try:
             for folder, dirnames, filenames in os.walk(root, followlinks=False):
                 dir_path = Path(folder)
@@ -108,13 +153,14 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
                         path_key = str(path.resolve())
                         examined += 1
                         previous = conn.execute(
-                            "SELECT size, mtime_ns, sha256 FROM files WHERE path = ?", (path_key,)
+                            "SELECT size, mtime_ns, sha256 FROM files WHERE path = ?",
+                            (path_key,),
                         ).fetchone()
                         if previous and previous[0] == stat.st_size and previous[1] == stat.st_mtime_ns:
                             checksum = previous[2]
                             reused += 1
                         else:
-                            checksum = sha256_file(path)
+                            checksum = sha256_file(path, count_hashed_bytes)
                             stat_after = path.stat()
                             if stat.st_size != stat_after.st_size or stat.st_mtime_ns != stat_after.st_mtime_ns:
                                 print(f"MODIFIÉ PENDANT LA LECTURE : {path}", file=sys.stderr)
@@ -122,19 +168,36 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
                                 continue
                             hashed += 1
 
-                        conn.execute("""
+                        conn.execute(
+                            """
                             INSERT INTO files(path, root, size, mtime_ns, sha256, checked_at, last_seen_scan)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(path) DO UPDATE SET
                                 root=excluded.root, size=excluded.size, mtime_ns=excluded.mtime_ns,
                                 sha256=excluded.sha256, checked_at=excluded.checked_at,
                                 last_seen_scan=excluded.last_seen_scan
-                        """, (path_key, str(root), stat.st_size, stat.st_mtime_ns, checksum, now, scan_id))
+                        """,
+                            (
+                                path_key,
+                                str(root),
+                                stat.st_size,
+                                stat.st_mtime_ns,
+                                checksum,
+                                now,
+                                scan_id,
+                            ),
+                        )
 
+                        # Commit périodiquement pour limiter la taille de la transaction.
+                        # Afficher la progression selon le temps écoulé, pas le nombre de fichiers.
+                        current_time = time.monotonic()
                         if examined % 1000 == 0:
                             conn.commit()
                             conn.execute("BEGIN")
-                            print(f"  {examined:,} fichiers examinés…", flush=True)
+                        elif current_time - last_progress >= 30:
+                            conn.commit()
+                            conn.execute("BEGIN")
+                            report_progress(current_time)
                     except OSError as exc:
                         print(f"ERREUR : {path} : {exc}", file=sys.stderr)
                         errors += 1
@@ -145,10 +208,13 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
             if errors == 0:
                 removed = conn.execute(
                     "DELETE FROM files WHERE root = ? AND last_seen_scan <> ?",
-                    (str(root), scan_id)
+                    (str(root), scan_id),
                 ).rowcount
             else:
-                print(f"Attention : {errors} erreur(s); aucune entrée ancienne supprimée pour {root}.", file=sys.stderr)
+                print(
+                    f"Attention : {errors} erreur(s); aucune entrée ancienne supprimée pour {root}.",
+                    file=sys.stderr,
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -157,11 +223,13 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
         total_examined += examined
         total_hashed += hashed
         total_reused += reused
+        total_bytes_hashed += bytes_hashed
         total_removed += removed
         total_errors += errors
         print(f"  Fichiers examinés : {examined:,}")
         print(f"  Checksums calculés : {hashed:,}")
         print(f"  Checksums réutilisés : {reused:,}")
+        print(f"  Données lues pour SHA-256 : {format_bytes(bytes_hashed)}")
         print(f"  Entrées supprimées : {removed:,}")
         print(f"  Erreurs : {errors:,}")
 
@@ -169,8 +237,10 @@ def scan(conn: sqlite3.Connection, roots: list[Path]) -> None:
     print(f"Fichiers examinés : {total_examined:,}")
     print(f"Checksums calculés : {total_hashed:,}")
     print(f"Checksums réutilisés : {total_reused:,}")
+    print(f"Données lues pour SHA-256 : {format_bytes(total_bytes_hashed)}")
     print(f"Entrées supprimées : {total_removed:,}")
     print(f"Erreurs / racines ignorées : {total_errors:,}")
+
 
 def duplicates(conn: sqlite3.Connection, csv_path: Path | None) -> None:
     query = """
@@ -191,7 +261,16 @@ def duplicates(conn: sqlite3.Connection, csv_path: Path | None) -> None:
         row_count = 0
         with csv_path.open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream, delimiter=";")
-            writer.writerow(["sha256", "nombre_fichiers", "taille_octets", "dossier", "fichier", "chemin_complet"])
+            writer.writerow(
+                [
+                    "sha256",
+                    "nombre_fichiers",
+                    "taille_octets",
+                    "dossier",
+                    "fichier",
+                    "chemin_complet",
+                ]
+            )
             for checksum, size, full_path, count in cursor:
                 path = Path(full_path)
                 writer.writerow([checksum, count, size, str(path.parent), path.name, full_path])
@@ -230,6 +309,7 @@ def main() -> int:
         print(f"Erreur SQLite : {exc}", file=sys.stderr)
         return 1
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
