@@ -3,12 +3,13 @@
 Critères (tous requis) : même chemin relatif, même taille, même SHA-256, même date de modification.
 
 Usage:
-  nettoyer_backup.py [--db=<db>] [--tolerance=<s>] [--apply]
+  nettoyer_backup.py [--db=<db>] [--tolerance=<s>] [--workers=<n>] [--apply]
   nettoyer_backup.py (-h | --help)
 
 Options:
   --db=<db>         Fichier SQLite [default: inventaire_fichiers.db].
   --tolerance=<s>   Écart de date toléré en secondes [default: 2].
+  --workers=<n>     Nombre de vérifications réseau en parallèle [default: 16].
   --apply           Supprimer réellement (sinon simulation seulement).
   -h --help         Afficher cette aide.
 """
@@ -16,18 +17,37 @@ Options:
 import os
 import sqlite3
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from docopt import docopt
 
 ORI = "/mnt/Public"
 BAK = "/mnt/MyBookNoir/PublicBackup"
+BATCH = 500
+
+
+def verifier(candidate):
+    """Revérifie l'état réel des deux fichiers (exécuté dans un fil)."""
+    bak_path, ori_path, size, bak_mtime, ori_mtime = candidate
+    try:
+        b = os.stat(bak_path)
+        if b.st_size != size or b.st_mtime_ns != bak_mtime:
+            return "stale", candidate, None
+        o = os.stat(ori_path)
+        if o.st_size != size or o.st_mtime_ns != ori_mtime:
+            return "stale", candidate, None
+        return "ok", candidate, None
+    except OSError as exc:
+        return "error", candidate, exc
 
 
 def main() -> int:
     args = docopt(__doc__)
     db_path = Path(args["--db"]).expanduser().resolve()
     tolerance_ns = int(float(args["--tolerance"]) * 1_000_000_000)
+    workers = int(args["--workers"])
     apply = args["--apply"]
 
     if not db_path.exists():
@@ -39,84 +59,104 @@ def main() -> int:
 
     bak_prefix = BAK.rstrip("/") + "/"
     ori_prefix = ORI.rstrip("/") + "/"
+    high = bak_prefix[:-1] + chr(ord("/") + 1)  # borne haute de l'intervalle de chemins
 
-    examined = identical = deleted = freed = 0
-    no_match = different = stale = errors = 0
-
+    # Phase 1 : comparaison dans la base seulement (aucun accès aux disques).
+    print("Phase 1 : comparaison dans la base...", file=sys.stderr)
     cursor = conn.execute(
-        "SELECT path, size, mtime_ns, sha256 FROM files WHERE path LIKE ? ESCAPE '\\'",
-        (
-            bak_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            + "%",
-        ),
+        """
+        SELECT b.path, b.size, b.mtime_ns, b.sha256, o.size, o.mtime_ns, o.sha256
+        FROM files AS b
+        LEFT JOIN files AS o ON o.path = ? || substr(b.path, ?)
+        WHERE b.path >= ? AND b.path < ?
+        """,
+        (ori_prefix, len(bak_prefix) + 1, bak_prefix, high),
+    )
+    examined = no_match = different = 0
+    candidates = []
+    for b_path, b_size, b_mtime, b_sha, o_size, o_mtime, o_sha in cursor:
+        examined += 1
+        if o_size is None:
+            no_match += 1
+        elif b_size != o_size or b_sha != o_sha or abs(b_mtime - o_mtime) > tolerance_ns:
+            different += 1
+        else:
+            ori_path = ori_prefix + b_path[len(bak_prefix) :]
+            candidates.append((b_path, ori_path, b_size, b_mtime, o_mtime))
+    conn.close()
+
+    total = len(candidates)
+    print(
+        f"Phase 1 terminée : {examined:,} fichiers dans PublicBackup, {total:,} candidats identiques.",
+        file=sys.stderr,
     )
 
-    for bak_path, bak_size, bak_mtime, bak_sha in cursor:
-        examined += 1
-        relative = bak_path[len(bak_prefix) :]
-        ori_path = ori_prefix + relative
+    # Phase 2 : vérification réseau en parallèle, puis suppression.
+    deleted = freed = stale = errors = done = 0
+    start = last_report = time.monotonic()
+    interrupted = False
 
-        ori = conn.execute(
-            "SELECT size, mtime_ns, sha256 FROM files WHERE path = ?", (ori_path,)
-        ).fetchone()
-        if ori is None:
-            no_match += 1
-            continue
+    def report():
+        elapsed = time.monotonic() - start
+        rate = done / elapsed if elapsed else 0
+        remaining = (total - done) / rate / 60 if rate else 0
+        print(
+            f"  {done:,}/{total:,} vérifiés | {deleted:,} "
+            f"{'supprimés' if apply else 'à supprimer'} | "
+            f"{rate:.1f} fichiers/s | reste ~{remaining:.0f} min",
+            file=sys.stderr,
+            flush=True,
+        )
 
-        ori_size, ori_mtime, ori_sha = ori
-        if (
-            bak_size != ori_size
-            or bak_sha != ori_sha
-            or abs(bak_mtime - ori_mtime) > tolerance_ns
-        ):
-            different += 1
-            continue
-
-        identical += 1
-
-        # Revérifier l'état réel des deux fichiers : la base peut dater un peu.
-        try:
-            bak_stat = os.stat(bak_path)
-            ori_stat = os.stat(ori_path)
-        except OSError as exc:
-            print(f"ERREUR : {exc}", file=sys.stderr)
-            errors += 1
-            continue
-        if (
-            bak_stat.st_size != bak_size
-            or bak_stat.st_mtime_ns != bak_mtime
-            or ori_stat.st_size != ori_size
-            or ori_stat.st_mtime_ns != ori_mtime
-        ):
-            print(f"IGNORÉ (modifié depuis l'inventaire) : {relative}")
-            stale += 1
-            continue
-
-        if apply:
-            try:
-                os.remove(bak_path)
-            except OSError as exc:
-                print(f"ERREUR suppression : {bak_path} : {exc}", file=sys.stderr)
-                errors += 1
-                continue
-            print(f"SUPPRIMÉ : {bak_path}")
-        else:
-            print(f"À SUPPRIMER : {bak_path}")
-        deleted += 1
-        freed += bak_size
-
-    conn.close()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for i in range(0, total, BATCH):
+                batch = candidates[i : i + BATCH]
+                for status, cand, exc in pool.map(verifier, batch):
+                    done += 1
+                    bak_path, ori_path, size, _, _ = cand
+                    if status == "error":
+                        print(f"ERREUR : {exc}", file=sys.stderr)
+                        errors += 1
+                    elif status == "stale":
+                        print(f"IGNORÉ (modifié depuis l'inventaire) : {bak_path}")
+                        stale += 1
+                    else:
+                        if apply:
+                            try:
+                                os.remove(bak_path)
+                            except OSError as exc2:
+                                print(
+                                    f"ERREUR suppression : {bak_path} : {exc2}",
+                                    file=sys.stderr,
+                                )
+                                errors += 1
+                                continue
+                            print(f"SUPPRIMÉ : {bak_path}")
+                        else:
+                            print(f"À SUPPRIMER : {bak_path}")
+                        deleted += 1
+                        freed += size
+                    if time.monotonic() - last_report >= 30:
+                        report()
+                        last_report = time.monotonic()
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrompu par l'utilisateur.", file=sys.stderr)
 
     verbe = "Supprimés" if apply else "À supprimer (simulation)"
     print("\nBilan")
     print(f"Fichiers examinés dans PublicBackup : {examined:,}")
     print(f"Sans équivalent dans Public         : {no_match:,}")
     print(f"Présents mais différents            : {different:,}")
-    print(f"Identiques                          : {identical:,}")
+    print(f"Candidats identiques (base)         : {total:,}")
+    print(f"Candidats vérifiés                  : {done:,}")
     print(f"Ignorés (modifiés depuis le scan)   : {stale:,}")
     print(f"{verbe:<36}: {deleted:,}")
     print(f"Espace libéré                       : {freed / 1024**3:.2f} Go")
     print(f"Erreurs                             : {errors:,}")
+    if interrupted:
+        print("Exécution incomplète (interrompue).")
     if not apply:
         print("\nSimulation seulement. Relancer avec --apply pour supprimer.")
     return 0
